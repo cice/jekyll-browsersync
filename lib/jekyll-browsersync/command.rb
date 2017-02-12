@@ -19,6 +19,10 @@ module Mlo
               "The port for Browsersync UI to run on"],
             "browsersync"        => ["--browser-sync [PATH]",
               "Specify the path to the Browsersync binary if in custom location."],
+            "bs_config"          => ["--bs-config [PATH]",
+              "Use a bs-config.js file instead of cli args for browser-sync. " +
+                "If no PATH is given, a temporary file is generated and deleted on exit. " +
+                "If a PATH is given, and the file does not exist, it will be generated."],
           }.freeze
 
           def init_with_program(prog)
@@ -43,6 +47,15 @@ module Mlo
                 opts['ui_port'] = 3001 unless opts.key?('ui_port')
                 opts['browsersync'] = locate_browsersync unless opts.key?('browsersync')
 
+                if opts.key?('bs_config')
+                  unless opts['bs_config']
+                    # Use a random, temporary bs-config file
+                    opts['bs_config'] = ".bs-config.#{SecureRandom.hex(10)}.js"
+                    opts['bs_config_temporary'] = true
+                  end
+                  opts['bs_config_generate'] = !File.exists?(opts['bs_config'])
+                end
+
                 validate!(opts)
 
                 config = opts['config']
@@ -57,6 +70,80 @@ module Mlo
             opts = configuration_from_options(opts)
             destination = opts['destination']
 
+            cmd = if opts['bs_config']
+              if opts['bs_config_generate']
+                generate_config_file(destination, opts)
+              end
+              get_browsersync_cmd_with_config_file(opts['browsersync'], opts['bs_config'])
+            else
+              get_browsersync_cmd(destination, opts)
+            end
+
+            PTY.spawn(cmd.join(' ')) do |stdout, stdin, pid|
+              trap("INT") do
+                Process.kill 'INT', pid
+                if opts['bs_config_temporary']
+                  ::Jekyll.logger.info "Deleting temporary browser-sync config file:", opts['bs_config']
+                  File.delete opts['bs_config']
+                end
+              end
+
+              ::Jekyll.logger.info "Server address:", server_address(opts)
+              ::Jekyll.logger.info "UI address:", server_address(opts, 'ui')
+
+              begin
+                stdout.each { |line| ::Jekyll.logger.debug line.rstrip }
+              rescue
+              end
+            end
+          end
+
+          def generate_config_file(destination, opts)
+            config_file = opts['bs_config']
+
+            # Set the default configuration
+            options = {
+              server: {
+                baseDir: destination,
+              },
+              files: destination,
+              port: opts['port'],
+              host: opts['host'],
+              ui: {
+                port: opts['ui_port']
+              }
+            }
+
+            # Check if there is a base url set, and add a route for it
+            base_url = opts['baseurl']
+            if base_url && base_url.strip != ''
+              options[:server][:routes] = {
+                base_url => destination
+              }
+            end
+            options[:https] = true if opts['https']
+            options[:open] = opts['open_url'] ? 'local' : false
+            options[:server][:directory] = true if opts['show_dir_listing']
+            options[:logLevel] = 'debug' if opts['verbose']
+
+            config_js = <<-JS.strip
+              module.exports = #{options.to_json};
+            JS
+
+            ::Jekyll.logger.info "Generating browser-sync config file:", config_file
+            ::Jekyll.logger.debug "Configuration for browser-sync:", options.inspect
+            File.write config_file, config_js
+          end
+
+          def get_browsersync_cmd_with_config_file(browsersync, config_file)
+            [
+              browsersync,
+              'start',
+              "--config #{config_file}",
+            ]
+          end
+
+          def get_browsersync_cmd(destination, opts)
             cmd = [
               opts['browsersync'],
               'start',
@@ -70,18 +157,7 @@ module Mlo
             cmd << '--https' if opts['https']
             cmd << '--no-open' unless opts['open_url']
             cmd << '--directory' if opts['show_dir_listing']
-
-            PTY.spawn(cmd.join(' ')) do |stdout, stdin, pid|
-              trap("INT") { Process.kill 'INT', pid }
-
-              ::Jekyll.logger.info "Server address:", server_address(opts)
-              ::Jekyll.logger.info "UI address:", server_address(opts, 'ui')
-
-              begin
-                stdout.each { |line| ::Jekyll.logger.debug line.rstrip }
-              rescue
-              end
-            end
+            cmd
           end
 
           private
@@ -100,10 +176,10 @@ module Mlo
 
           def server_address(opts, server = nil)
             format("%{protocol}://%{address}:%{port}%{baseurl}", {
-              :protocol => opts['https'] ? 'https' : 'http',
-              :address => opts['host'],
-              :port => server == 'ui' ? opts['ui_port'] : opts['port'],
-              :baseurl => opts['baseurl'] ? "#{opts["baseurl"]}/" : '',
+              protocol: opts['https'] ? 'https' : 'http',
+              address: opts['host'],
+              port: server == 'ui' ? opts['ui_port'] : opts['port'],
+              baseurl: opts['baseurl'] ? "#{opts["baseurl"]}/" : '',
             })
           end
 
